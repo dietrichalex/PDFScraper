@@ -225,7 +225,15 @@ def parse_llm_json_array(content):
 # STRATEGY A: table-of-contents based extraction (primary)
 # --------------------------------------------------------------------------
 
-_STANDALONE_NUMBER_LINE = re.compile(r"^\d{1,4}$")
+_STANDALONE_NUMBER_LINE = re.compile(r"^\d{1,3}$")
+
+
+def _clean_number_candidate(line):
+    """Strip common dot-leader/OCR artifacts (periods, dots, spaces) from the
+    edges of a line before checking whether it's purely a page number - OCR
+    on older scans often bleeds a trailing/leading dot-leader dot onto the
+    same line as the page number."""
+    return line.strip(" .\u2026\t")
 
 
 def _score_toc_page(text):
@@ -240,7 +248,7 @@ def _score_toc_page(text):
     TOC page tends to have one such line per listed article; an ordinary
     body page essentially never does."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    standalone_number_lines = sum(1 for l in lines if _STANDALONE_NUMBER_LINE.match(l))
+    standalone_number_lines = sum(1 for l in lines if _STANDALONE_NUMBER_LINE.match(_clean_number_candidate(l)))
     bonus = 5 if "contents" in text[:300].lower() else 0
     return standalone_number_lines + bonus, standalone_number_lines
 
@@ -299,7 +307,8 @@ def deterministic_parse_toc_entries(toc_pages, page_texts):
     entries = []
     for page_idx in toc_pages:
         lines = [l.strip() for l in page_texts[page_idx].split("\n") if l.strip()]
-        number_indices = [i for i, l in enumerate(lines) if _STANDALONE_NUMBER_LINE.match(l)]
+        cleaned = [_clean_number_candidate(l) for l in lines]
+        number_indices = [i for i, l in enumerate(cleaned) if _STANDALONE_NUMBER_LINE.match(l)]
         for k, num_idx in enumerate(number_indices):
             if num_idx == 0:
                 continue  # no line before this number - can't be a real title+page pair
@@ -307,12 +316,22 @@ def deterministic_parse_toc_entries(toc_pages, page_texts):
             if len(title) < 3 or not re.search(r"[a-zA-Z]", title):
                 continue  # too short/junk to plausibly be a real title
             try:
-                printed_page = int(lines[num_idx])
+                printed_page = int(cleaned[num_idx])
             except ValueError:
                 continue
             end_idx = number_indices[k + 1] - 1 if k + 1 < len(number_indices) else len(lines)
             aux_text = "\n".join(lines[num_idx + 1:end_idx])
             entries.append({"title": title, "printed_page": printed_page, "aux_text": aux_text})
+
+    if len(entries) < 3 and DEBUG:
+        print("  [debug] Very few TOC entries parsed. Raw lines per detected TOC page:", file=sys.stderr)
+        for page_idx in toc_pages:
+            lines = [l.strip() for l in page_texts[page_idx].split("\n") if l.strip()]
+            print(f"    --- page {page_idx + 1} ({len(lines)} lines) ---", file=sys.stderr)
+            for l in lines[:40]:
+                marker = " <-- looks like a number" if _STANDALONE_NUMBER_LINE.match(_clean_number_candidate(l)) else ""
+                print(f"      {l!r}{marker}", file=sys.stderr)
+
     return entries
 
 
@@ -420,6 +439,38 @@ def segment_pdf_via_toc(pdf_path, doc, page_texts, num_pages):
 
     info_by_index = extract_subtitles_and_authors(toc_entries)
 
+    # Some magazines print a secondary "contributors" mini-index (author
+    # name -> page number) elsewhere on the same TOC page(s), which the
+    # deterministic parser can't structurally distinguish from a real
+    # title+page pair. Filter those out: if an entry's "title" exactly
+    # matches an author name that was extracted for some OTHER entry, it's
+    # almost certainly this secondary index, not a genuine article.
+    known_author_names = set()
+    for info in info_by_index.values():
+        for a in info.get("authors", []):
+            known_author_names.add(a.strip().lower())
+
+    def _looks_like_author_list(title):
+        # Handles both a single name matching exactly, and a combined
+        # "A and B" / "A, B, and C" string where every part is itself a
+        # known author name from some other entry.
+        parts = re.split(r"\s*(?:,|&|\band\b)\s*", title, flags=re.IGNORECASE)
+        parts = [p.strip().lower() for p in parts if p.strip()]
+        if not parts:
+            return False
+        return all(p in known_author_names for p in parts)
+
+    filtered_entries = []
+    filtered_indices = []
+    for i, entry in enumerate(toc_entries):
+        if _looks_like_author_list(entry["title"]):
+            print(f"  [-] \"{entry['title']}\": looks like a contributor-index name, not a real title - skipping")
+            continue
+        filtered_entries.append(entry)
+        filtered_indices.append(i)
+    toc_entries_original = toc_entries
+    toc_entries = filtered_entries
+
     # Estimate the offset between "printed page number" and "PDF page index"
     # from the first entry we can confidently locate, then use it to help
     # disambiguate later matches (title text can occasionally appear more
@@ -428,7 +479,8 @@ def segment_pdf_via_toc(pdf_path, doc, page_texts, num_pages):
     located = []  # list of (pdf_page_0based, title, authors)
     offset_estimate = None
 
-    for i, entry in enumerate(toc_entries):
+    for filtered_i, entry in enumerate(toc_entries):
+        i = filtered_indices[filtered_i]
         title = entry["title"]
         printed_page = entry["printed_page"]
         info = info_by_index.get(i, {})
