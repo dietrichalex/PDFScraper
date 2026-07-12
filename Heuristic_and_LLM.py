@@ -87,7 +87,7 @@ DEBUG = True  # print raw LLM replies / failure reasons to help diagnose issues
 # Hardcoded folder structure (relative to this script's location):
 #   ./data/     -> input PDFs
 #   ./output/   -> output CSV
-INPUT_DIR = Path(__file__).parent / "data"
+INPUT_DIR = Path(__file__).parent / "mini_data"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_CSV = OUTPUT_DIR / "articles_index.csv"
 
